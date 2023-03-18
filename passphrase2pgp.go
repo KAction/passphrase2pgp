@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	stdpem "encoding/pem"
 	"fmt"
@@ -40,6 +42,7 @@ const (
 	formatPGP = iota
 	formatSSH
 	formatX509
+	formatSignify
 )
 
 var version = "1.2.0"
@@ -137,7 +140,7 @@ func usage(w io.Writer) {
 	}
 	f("Usage:")
 	f(i, p, "<-u id|-l key> [-hv] [-c id] [-i pwfile] [--pinentry[=cmd]]")
-	f(b, "-K [-anps] [-e[n]] [-f pgp|ssh|x509] [-r n] [-t secs] [-x[spec]]")
+	f(b, "-K [-anps] [-e[n]] [-f pgp|ssh|x509|signify] [-r n] [-t secs] [-x[spec]]")
 	f(b, "-S [-a] [-r n] [files...]")
 	f(b, "-T [-r n] >doc-signed.txt <doc.txt")
 	f("Commands:")
@@ -148,7 +151,7 @@ func usage(w io.Writer) {
 	f(i, "-a, --armor               encode output in ASCII armor")
 	f(i, "-c, --check KEYID         require last Key ID bytes to match")
 	f(i, "-e, --protect[=ASKS]      protect private key with S2K")
-	f(i, "-f, --format pgp|ssh|x509 select key format [pgp]")
+	f(i, "-f, --format pgp|ssh|x509|signify select key format [pgp]")
 	f(i, "-h, --help                print this help message")
 	f(i, "-i, --input FILE          read passphrase from file")
 	f(i, "-l, --load FILE           load key from file instead of generating")
@@ -270,6 +273,8 @@ func parse() *config {
 				conf.format = formatSSH
 			case "x509":
 				conf.format = formatX509
+			case "signify":
+				conf.format = formatSignify
 			default:
 				fatal("invalid format: %s", result.Optarg)
 			}
@@ -537,6 +542,8 @@ func main() {
 			ck.outputSSH(config)
 		case formatX509:
 			ck.outputX509(config)
+		case formatSignify:
+			ck.outputSignify(config)
 		}
 
 	case cmdSign:
@@ -714,6 +721,44 @@ func (k *completeKey) outputSSH(config *config) {
 	}
 	b := pubSSH(pubkey, uid)
 	if _, err := os.Stdout.Write(b); err != nil {
+		fatal("%s", err)
+	}
+}
+
+func (k *completeKey) outputSignify(config *config) {
+	key := k.key
+	comment := func(kind string) string {
+		return fmt.Sprintf("untrusted comment: signify %s key for %s\n", kind, string(k.userid.ID))
+	}
+
+	output := ""
+	nul := []byte{0}
+
+	// https://github.com/aperezdc/signify/blob/7960f786e4925b49d73be70a8af4f9834555b97a/signify.c#L62
+	//
+	// TODO: hash userid into keynum and salt. We have 24 bytes to play with.
+	pubkey := []byte("Ed")
+	pubkey = append(pubkey, bytes.Repeat(nul, 8)...)
+	pubkey = append(pubkey, key.Pubkey()...)
+
+	output += comment("public")
+	output += base64.StdEncoding.EncodeToString(pubkey) + "\n"
+
+	if !config.public {
+		hash := sha512.Sum512([]byte(key.Key))
+
+		privkey := []byte("Ed")                             // pkalg
+		privkey = append(privkey, []byte("BK")...)          // kdfalg
+		privkey = append(privkey, bytes.Repeat(nul, 4)...)  // kdfrounds
+		privkey = append(privkey, bytes.Repeat(nul, 16)...) // salt
+		privkey = append(privkey, hash[0:8]...)             // checksum
+		privkey = append(privkey, bytes.Repeat(nul, 8)...)  // keynum
+		privkey = append(privkey, []byte(key.Key)...)       // seckey (64 bytes)
+		output += comment("private")
+		output += base64.StdEncoding.EncodeToString(privkey) + "\n"
+	}
+
+	if _, err := os.Stdout.WriteString(output); err != nil {
 		fatal("%s", err)
 	}
 }
